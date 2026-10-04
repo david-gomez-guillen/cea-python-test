@@ -1,0 +1,3 @@
+# For running the Python model on its own (python example.py), outside THALASSA.
+numpy
+pandas
