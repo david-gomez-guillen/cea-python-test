@@ -27,11 +27,43 @@ get.model.settings <- function() {
 }
 
 get.strategies <- function() {
-  # The names must match model.STRATEGIES in model.py.
+  # The names must match model.STRATEGIES in model.py. The descriptions and
+  # attributes describe strategy_arms() and simulate_strategy() in model.py, and
+  # must be kept in sync with them.
   return(list(
-    list(name='chemotherapy', display.name='Chemotherapy for all'),
-    list(name='immunotherapy', display.name='Immunotherapy for all'),
-    list(name='biomarker_immunotherapy', display.name='Biomarker-guided immunotherapy')
+    list(
+      name='chemotherapy',
+      display.name='Chemotherapy for all',
+      description='The comparator. Every patient receives chemotherapy for chemo.months months while progression-free.',
+      attributes=list(immunotherapy='None', chemotherapy='All patients', biomarker.test='No')
+    ),
+    list(
+      name='immunotherapy',
+      display.name='Immunotherapy for all',
+      description='Every patient receives the immunotherapy until progression, for at most immuno.max.months months. It multiplies the rate of progression by hr.progression.positive in biomarker-positive patients and by hr.progression.negative in the rest.',
+      attributes=list(immunotherapy='All patients', chemotherapy='None', biomarker.test='No')
+    ),
+    list(
+      name='biomarker_immunotherapy',
+      display.name='Biomarker-guided immunotherapy',
+      description='Every patient is tested for the biomarker, at cost.biomarker.test each. Biomarker-positive patients (p.biomarker.positive) receive the immunotherapy and the rest receive chemotherapy.',
+      attributes=list(immunotherapy='Biomarker-positive', chemotherapy='Biomarker-negative', biomarker.test='Yes')
+    )
+  ))
+}
+
+get.strategy.attributes <- function() {
+  # What describes the strategies, shown as columns of the Strategies tab. Only
+  # who receives the immunotherapy is drawn on the base case plot, as the shape
+  # of the point.
+  return(list(
+    immunotherapy=list(
+      label='Immunotherapy for',
+      plot='shape',
+      values=c(None='x', `All patients`='circle', `Biomarker-positive`='square')
+    ),
+    chemotherapy='Chemotherapy for',
+    biomarker.test='Biomarker test'
   ))
 }
 
@@ -49,64 +81,86 @@ get.strata <- function() {
 python.name <- function(name) gsub('.', '_', name, fixed=TRUE)
 base.value <- function(name) model$base_case()[[python.name(name)]]
 
-# Constraints: each returns TRUE when the parameters are acceptable. A constraint
-# that ties two parameters together is declared on both, so that the app
-# highlights whichever of them the user changed. A parameter split into strata
-# arrives as a list, hence the unlist().
-is.probability <- function(name) {
-  force(name)
-  function(params) all(unlist(params[[name]]) >= 0) && all(unlist(params[[name]]) <= 1)
+# Constraints: each returns TRUE when the value is acceptable, or the message
+# shown for it when it is not. A constraint that ties two parameters together is
+# declared on both, so that the app highlights whichever of them the user
+# changed. A parameter split into strata arrives as a list, hence the unlist().
+is.probability <- function(par.name, params) {
+  x <- unlist(params[[par.name]])
+  if (any(x < 0 | x > 1)) sprintf('%s must be between 0 and 1', par.name) else TRUE
 }
-death.pfs.below.progressed <- function(params) {
-  all(unlist(params[['p.death.pfs']]) < unlist(params[['p.death.progressed']]))
+death.pfs.below.progressed <- function(par.name, params) {
+  if (any(unlist(params[['p.death.pfs']]) >= unlist(params[['p.death.progressed']])))
+    'Death while progression-free must be less likely than after progression'
+  else TRUE
 }
-utility.pfs.above.progressed <- function(params) {
-  params[['utility.pfs']] > params[['utility.progressed']]
+utility.pfs.above.progressed <- function(par.name, params) {
+  if (params[['utility.pfs']] <= params[['utility.progressed']])
+    sprintf('Utility while progression-free (%g) must be higher than after progression (%g)',
+            params[['utility.pfs']], params[['utility.progressed']])
+  else TRUE
 }
-positive.benefit.more <- function(params) {
-  params[['hr.progression.positive']] < params[['hr.progression.negative']]
+positive.benefit.more <- function(par.name, params) {
+  if (params[['hr.progression.positive']] >= params[['hr.progression.negative']])
+    sprintf(paste('Biomarker-positive patients must benefit more than biomarker-negative ones',
+                  '(hazard ratios %g and %g)'),
+            params[['hr.progression.positive']], params[['hr.progression.negative']])
+  else TRUE
 }
 
-parameter <- function(name, display.name, class, constraints=NULL) {
+# distribution is the one the PSA draws the parameter from. The treatment
+# schedules and the discount rate declare none, which keeps them out of the PSA.
+# min.value and max.value bound the values the user can enter: 0 to 1 for
+# probabilities, utilities and the discount rate, and above 0 for costs.
+parameter <- function(name, display.name, class, constraints=NULL, distribution=NULL,
+                      min.value=NULL, max.value=NULL) {
   p <- list(name=name, display.name=display.name, base.value=base.value(name), class=class)
   if (!is.null(constraints)) p$constraints <- constraints
+  if (!is.null(distribution)) p$distribution <- distribution
+  if (!is.null(min.value)) p$min.value <- min.value
+  if (!is.null(max.value)) p$max.value <- max.value
   return(p)
 }
 
 get.parameters <- function() {
   return(list(
     parameter('p.progression', 'Monthly probability of progression on chemotherapy', 'Natural history',
-              list(`Progression must be a probability`=is.probability('p.progression'))),
+              list(is.probability), distribution='beta',
+              min.value=0, max.value=1),
     parameter('p.death.pfs', 'Monthly probability of death while progression-free', 'Natural history',
-              list(`Death while progression-free must be a probability`=is.probability('p.death.pfs'),
-                   `Death while progression-free must be lower than after progression`=death.pfs.below.progressed)),
+              list(is.probability, death.pfs.below.progressed), distribution='beta',
+              min.value=0, max.value=1),
     parameter('p.death.progressed', 'Monthly probability of death after progression', 'Natural history',
-              list(`Death after progression must be a probability`=is.probability('p.death.progressed'),
-                   `Death while progression-free must be lower than after progression`=death.pfs.below.progressed)),
+              list(is.probability, death.pfs.below.progressed), distribution='beta',
+              min.value=0, max.value=1),
 
     parameter('p.biomarker.positive', 'Share of biomarker-positive patients', 'Biomarker and immunotherapy',
-              list(`The share of biomarker-positive patients must be a probability`=is.probability('p.biomarker.positive'))),
+              list(is.probability), distribution='beta',
+              min.value=0, max.value=1),
     parameter('hr.progression.positive', 'Hazard ratio of progression, immunotherapy vs chemotherapy, biomarker-positive', 'Biomarker and immunotherapy',
-              list(`Biomarker-positive patients must benefit more than biomarker-negative ones`=positive.benefit.more)),
+              list(positive.benefit.more), distribution='lognormal'),
     parameter('hr.progression.negative', 'Hazard ratio of progression, immunotherapy vs chemotherapy, biomarker-negative', 'Biomarker and immunotherapy',
-              list(`Biomarker-positive patients must benefit more than biomarker-negative ones`=positive.benefit.more)),
+              list(positive.benefit.more), distribution='lognormal'),
 
     parameter('chemo.months', 'Months of chemotherapy', 'Treatment schedules'),
     parameter('immuno.max.months', 'Maximum months of immunotherapy (stopped earlier at progression)', 'Treatment schedules'),
 
-    parameter('cost.chemo', 'Monthly cost of chemotherapy', 'Costs'),
-    parameter('cost.immuno', 'Monthly cost of immunotherapy', 'Costs'),
-    parameter('cost.biomarker.test', 'Cost of a biomarker test', 'Costs'),
-    parameter('cost.pfs.care', 'Monthly cost of care while progression-free', 'Costs'),
-    parameter('cost.progressed.care', 'Monthly cost of care after progression, including later lines', 'Costs'),
-    parameter('cost.end.of.life', 'One-off cost of end-of-life care', 'Costs'),
+    parameter('cost.chemo', 'Monthly cost of chemotherapy', 'Costs', distribution='gamma', min.value=0),
+    parameter('cost.immuno', 'Monthly cost of immunotherapy', 'Costs', distribution='gamma', min.value=0),
+    parameter('cost.biomarker.test', 'Cost of a biomarker test', 'Costs', distribution='gamma', min.value=0),
+    parameter('cost.pfs.care', 'Monthly cost of care while progression-free', 'Costs', distribution='gamma', min.value=0),
+    parameter('cost.progressed.care', 'Monthly cost of care after progression, including later lines', 'Costs', distribution='gamma', min.value=0),
+    parameter('cost.end.of.life', 'One-off cost of end-of-life care', 'Costs', distribution='gamma', min.value=0),
 
     parameter('utility.pfs', 'Utility while progression-free', 'Utilities',
-              list(`Utility while progression-free must be higher than after progression`=utility.pfs.above.progressed)),
+              list(utility.pfs.above.progressed), distribution='beta',
+              min.value=0, max.value=1),
     parameter('utility.progressed', 'Utility after progression', 'Utilities',
-              list(`Utility while progression-free must be higher than after progression`=utility.pfs.above.progressed)),
+              list(utility.pfs.above.progressed), distribution='beta',
+              min.value=0, max.value=1),
 
-    parameter('discount', 'Annual discount rate for costs and QALYs', 'General')
+    parameter('discount', 'Annual discount rate for costs and QALYs', 'General',
+              min.value=0, max.value=1)
   ))
 }
 
